@@ -1,0 +1,190 @@
+---
+- name: ec2 launcher
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    key_name: aws_key
+    region: us-east-2
+    ami: ami-0e82959d4ed12de3f
+    instance_type: t2.micro
+    vpc_subnet_id: subnet-c996eb85
+    sec_group_web: tomcat_group
+    sec_group_mvn: maven_group
+
+  tasks:
+    - name: Create a new EC2 key
+      ec2_key:
+        name: "{{ key_name }}"
+        region: "{{ region }}"
+      register: ec2_key
+ 
+    - name: Save private key
+      copy: content="{{ ec2_key.key.private_key }}" dest="./{{ key_name }}.pem" mode=0600
+      when: ec2_key.changed
+
+    - name: Create a security group for maven
+      local_action: 
+        module: ec2_group
+        name: "{{ sec_group_mvn }}"
+        description: Security Group for maven Servers
+        region: "{{ region }}"
+        rules:
+          - proto: tcp
+            from_port: 22
+            to_port: 22
+            cidr_ip: 0.0.0.0/0
+        rules_egress:
+          - proto: all
+            cidr_ip: 0.0.0.0/0
+
+    - name: Create a security group for tomcat
+      local_action: 
+        module: ec2_group
+        name: "{{ sec_group_web }}"
+        description: Security Group for tomcat Servers
+        region: "{{ region }}"
+        rules:
+          - proto: tcp
+            from_port: 22
+            to_port: 22
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 8080
+            to_port: 8080
+            cidr_ip: 0.0.0.0/0
+        rules_egress:
+          - proto: all
+            cidr_ip: 0.0.0.0/0
+
+    - name: launching ec2 mavenserver
+      ec2:
+        instance_type: "{{ instance_type }}"
+        key_name: "{{ key_name }}"
+        image: "{{ ami }}"
+        region: "{{ region }}"
+        group: maven_group
+        count: 1
+        vpc_subnet_id: "{{ vpc_subnet_id }}"
+        wait: true
+        assign_public_ip: true
+      register: ec2_maven
+
+    - debug: var=ec2_maven
+    - add_host: hostname={{ ec2_maven.instances[0].public_ip }} groupname=maven_group
+
+    - name: launching ec2 webserver
+      ec2:
+        instance_type: "{{ instance_type }}"
+        key_name: "{{ key_name }}"
+        image: "{{ ami }}"
+        region: "{{ region }}"
+        group: tomcat_group
+        count: 1
+        vpc_subnet_id: "{{ vpc_subnet_id }}"
+        wait: true
+        assign_public_ip: true
+      register: ec2_tomcat
+
+    - debug: var=ec2_tomcat
+    - add_host: hostname={{ ec2_tomcat.instances[0].public_ip }} groupname=tomcat_group
+
+- hosts: maven_group
+  become: true
+  connection: ssh
+  remote_user: ubuntu
+  gather_facts: true
+  vars:
+    proj_dir: /var/lib/boxfuse-sample-java-war-hello
+    ansible_ssh_common_args: "-i aws_key.pem -o StrictHostKeyChecking=no"
+    ansible_ssh_user: "ubuntu"
+
+  tasks:
+    - name: Python
+      apt:
+        pkg: python
+        state: present
+        update_cache: true
+
+    - name: JDK
+      apt:
+        pkg: default-jdk
+        state: present
+        update_cache: true
+
+    - name: Maven
+      apt:
+        pkg: maven
+        state: present
+        update_cache: true
+
+    - name: Prepare project dir
+      file:
+        path: "{{ proj_dir }}"
+        state: absent
+
+    - name: clone project
+      git:
+        repo: https://github.com/boxfuse/boxfuse-sample-java-war-hello.git
+        dest: "{{ proj_dir }}"
+
+    - name: Building app
+      shell: "mvn package -f {{ proj_dir }}/pom.xml"
+
+    - name: Packing artifact
+      archive:
+        path: "{{ proj_dir }}/target/hello-1.0/*"
+        dest: /tmp/hello.tar.gz
+
+    - name: Get artifact
+      fetch:
+        src: "/tmp/hello.tar.gz"
+        dest: "/tmp/"
+        flat: true
+
+# prod
+- hosts: tomcat_group
+  become: true
+  connection: ssh
+  remote_user: ubuntu
+  gather_facts: true
+  vars:
+    proj_dir: /var/lib/boxfuse-sample-java-war-hello
+    tomcat_dir: /usr/local/tomcat
+    www_root: "/var/lib/tomcat8/webapps/ROOT"
+    ansible_ssh_common_args: "-i aws_key.pem -o StrictHostKeyChecking=no"
+    ansible_ssh_user: "ubuntu"
+
+  tasks:
+    - name: tomcat
+      apt:
+        pkg: tomcat8
+        state: present
+        update_cache: true
+    
+    - name: clear web root folder
+      file:
+        path: "{{ www_root }}"
+        state: absent
+
+    - name: web root folder exists
+      file:
+        path: "{{ www_root }}"
+        state: directory
+
+    - name: get artifacts 
+      copy:
+        src: /tmp/hello.tar.gz
+        dest: /tmp/hello.tar.gz
+
+    # - name: extract - not working, may be a bug
+    #  unarchive:
+    #    src: /tmp/hello.tar.gz
+    #    dest: "{{ www_root }}"
+
+    - name: extracting to web root folder
+      shell: "tar -C {{ www_root }} -xvf /tmp/hello.tar.gz"
+
+    - name: restart tomcat
+      service: name=tomcat8 state=started enabled=yes
